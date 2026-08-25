@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # Sorting algorithm for data balance
+import heapq
 from typing import List
 
 import torch
@@ -46,14 +47,20 @@ def post_mbs_balancing_greedy_without_pad(
     lengths_per_sequence = (all_data_lengths[:, dim] ** 2).cpu()
 
     pre_fill_num = min(num_replicas, len(all_data_lengths))
-    dp_group_total_length = torch.empty(num_replicas, dtype=torch.long)
-    dp_group_total_length[:pre_fill_num] = lengths_per_sequence[:pre_fill_num]
     balanced_image_dp_batch = [[all_data_lengths[i]] if i < pre_fill_num else [] for i in range(num_replicas)]
 
+    # Track each bin's load in a min-heap keyed by (load, dp group), so the least-loaded bin can be
+    # popped in O(log num_replicas) instead of an O(num_replicas) argmin scan over every assignment.
+    # Ordering by (load, dp group) breaks ties toward the smaller dp group, matching argmin.
+    dp_group_total_length = [(lengths_per_sequence[i].item(), i) for i in range(pre_fill_num)]
+    dp_group_total_length += [(0, i) for i in range(pre_fill_num, num_replicas)]
+    heapq.heapify(dp_group_total_length)
+
     for i, sequence_lentgh in enumerate(all_data_lengths[pre_fill_num:]):
-        target_dp_group = dp_group_total_length.argmin()
+        current_length, target_dp_group = heapq.heappop(dp_group_total_length)
         balanced_image_dp_batch[target_dp_group].extend([sequence_lentgh])
-        dp_group_total_length[target_dp_group] += lengths_per_sequence[i + num_replicas]
+        new_length = current_length + lengths_per_sequence[i + num_replicas].item()
+        heapq.heappush(dp_group_total_length, (new_length, target_dp_group))
 
     return balanced_image_dp_batch
 

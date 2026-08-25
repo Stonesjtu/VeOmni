@@ -62,3 +62,47 @@ def test_post_mbs_balancing_greedy_without_pad_s2():
     )
 
     check_balance_sorting(rank_table, balanced_fake_data_lengths_per_dp)
+
+
+def _argmin_reference(all_data_lengths, num_replicas, dim):
+    # The original argmin-scan greedy, kept here to pin the heap scheduler to the same assignment.
+    sort_indice = torch.argsort(all_data_lengths[:, dim].float(), descending=True)
+    all_data_lengths = all_data_lengths[sort_indice]
+    lengths_per_sequence = (all_data_lengths[:, dim] ** 2).cpu()
+
+    pre_fill_num = min(num_replicas, len(all_data_lengths))
+    dp_group_total_length = torch.empty(num_replicas, dtype=torch.long)
+    dp_group_total_length[:pre_fill_num] = lengths_per_sequence[:pre_fill_num]
+    balanced_image_dp_batch = [[all_data_lengths[i]] if i < pre_fill_num else [] for i in range(num_replicas)]
+
+    for i, sequence_lentgh in enumerate(all_data_lengths[pre_fill_num:]):
+        target_dp_group = dp_group_total_length.argmin()
+        balanced_image_dp_batch[target_dp_group].extend([sequence_lentgh])
+        dp_group_total_length[target_dp_group] += lengths_per_sequence[i + num_replicas]
+
+    return balanced_image_dp_batch
+
+
+def test_post_mbs_balancing_greedy_matches_argmin_reference():
+    # The heap scheduler must produce the exact same bin assignment (including tie-breaking) as the
+    # original argmin-scan greedy it replaces.
+    device = get_device_type()
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    for _ in range(64):
+        num_replicas = int(torch.randint(2, 9, (1,), generator=generator).item())
+        num_data = int(torch.randint(num_replicas, 128, (1,), generator=generator).item())
+        source_rank = torch.arange(num_data, device=device) % num_replicas
+        source_index = torch.arange(num_data, device=device)
+        lengths = torch.randint(1, 10000, (num_data,), generator=generator).to(device)
+        all_data_lengths = torch.stack((source_rank, source_index, lengths), dim=1)
+
+        rank_table = SORTING_ALGO_FUNC["post_mbs_balancing_greedy_without_pad"](
+            all_data_lengths, num_replicas=num_replicas, dim=2
+        )
+        reference = _argmin_reference(all_data_lengths, num_replicas=num_replicas, dim=2)
+
+        assert len(rank_table) == len(reference)
+        for actual_bucket, expected_bucket in zip(rank_table, reference):
+            assert len(actual_bucket) == len(expected_bucket)
+            for actual_row, expected_row in zip(actual_bucket, expected_bucket):
+                assert torch.equal(actual_row, expected_row)
